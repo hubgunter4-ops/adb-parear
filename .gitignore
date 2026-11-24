@@ -1,0 +1,9 @@
+# Local OS/editor metadata
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Temporary output
+*.log
+__pycache__/
