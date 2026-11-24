@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Emparejamiento inalámbrico de Android con ADB en Ubuntu.
+# Emparejamiento y conexión inalámbrica de Android con ADB en Ubuntu.
 # Requiere adb; qrencode solo para el modo QR.
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 TIMEOUT=120
+CONNECT_TIMEOUT=15
 APP_NAME="adb-parear"
 
 if [[ -t 1 && -n "${TERM:-}" && "${TERM:-}" != "dumb" ]]; then
@@ -27,18 +28,19 @@ trap on_interrupt INT TERM
 
 usage() {
   cat <<EOF
-$APP_NAME $VERSION — empareja Android por ADB inalámbrico.
+$APP_NAME $VERSION — empareja y conecta Android por ADB inalámbrico.
 
 Uso:
   $APP_NAME                 Abrir el menú interactivo
-  $APP_NAME --qr            Emparejar mostrando un QR en el terminal
-  $APP_NAME --code          Emparejar con IP:puerto y código de seis dígitos
+  $APP_NAME --qr            Emparejar con QR, conectar y verificar
+  $APP_NAME --code          Emparejar con IP:puerto/PIN, conectar y verificar
   $APP_NAME --list          Mostrar dispositivos ADB conectados/autorizados
   $APP_NAME --timeout SEC   Cambiar el tiempo de espera del modo QR (10–900)
   $APP_NAME --help          Mostrar esta ayuda
 
 En modo QR, el QR aparece en Ubuntu y se escanea desde el móvil:
 Opciones de desarrollador > Depuración inalámbrica > Emparejar dispositivo con código QR.
+Tras emparejar, el programa ejecuta adb connect y verifica el estado device.
 EOF
 }
 
@@ -101,6 +103,15 @@ find_pairing_services() {
   ' | sort -u
 }
 
+find_connect_services() {
+  adb mdns services 2>/dev/null | awk '
+    /_adb-tls-connect[.]_tcp/ {
+      address = $NF
+      if (address ~ /:[0-9]+$/) print $1 "\t" address
+    }
+  ' | sort -u
+}
+
 choose_service() {
   local -n found_ref=$1
   local selection
@@ -127,6 +138,84 @@ choose_service() {
     fi
     warn "Elige un número de la lista."
   done
+}
+
+choose_connect_service() {
+  local -n found_ref=$1
+  local selection
+  if ((${#found_ref[@]} == 1)); then
+    CONNECT_ENDPOINT="${found_ref[0]#*$'\t'}"
+    printf 'Servicio de conexión encontrado: %s (%s)\n' "${found_ref[0]%$'\t'*}" "$CONNECT_ENDPOINT"
+    return 0
+  fi
+
+  printf '\n%sServicios ADB de conexión detectados:%s\n' "$C_BOLD" "$C_RESET"
+  local i label address
+  for i in "${!found_ref[@]}"; do
+    label="${found_ref[$i]%$'\t'*}"
+    address="${found_ref[$i]#*$'\t'}"
+    printf '  %d) %-34s %s\n' "$((i + 1))" "$label" "$address"
+  done
+  while true; do
+    printf 'Elige el número del dispositivo que acabas de emparejar (o q para cancelar): '
+    IFS= read -r selection || return 1
+    [[ "$selection" == "q" || "$selection" == "Q" ]] && return 1
+    if [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= ${#found_ref[@]} )); then
+      CONNECT_ENDPOINT="${found_ref[$((selection - 1))]#*$'\t'}"
+      return 0
+    fi
+    warn "Elige un número de la lista."
+  done
+}
+
+connect_after_pairing() {
+  local elapsed=0
+  local -a services=()
+  local CONNECT_ENDPOINT=''
+  printf '\n'
+  info "Buscando el servicio ADB de conexión por mDNS (hasta ${CONNECT_TIMEOUT}s)…"
+  while (( elapsed < CONNECT_TIMEOUT )); do
+    mapfile -t services < <(find_connect_services)
+    if ((${#services[@]} > 0)); then
+      break
+    fi
+    sleep 1
+    ((elapsed += 1))
+  done
+
+  if ((${#services[@]} > 0)); then
+    choose_connect_service services || { warn "No se seleccionó un dispositivo para conectar."; return 1; }
+  else
+    warn "No encontré un servicio mDNS de conexión. El puerto de conexión es distinto del puerto de emparejamiento."
+    printf 'Escribe el IP:puerto que aparece en la pantalla principal de Depuración inalámbrica: '
+    IFS= read -r CONNECT_ENDPOINT || return 1
+    if [[ -z "$CONNECT_ENDPOINT" ]]; then
+      err "Se necesita el IP:puerto de conexión para completar el proceso."
+      return 1
+    fi
+  fi
+
+  if ! valid_endpoint "$CONNECT_ENDPOINT"; then
+    err "Dirección de conexión no válida: $CONNECT_ENDPOINT"
+    return 2
+  fi
+
+  printf '\n'
+  info "Conectando con adb connect ${CONNECT_ENDPOINT}…"
+  if ! adb connect "$CONNECT_ENDPOINT"; then
+    err "'adb connect' falló para ${CONNECT_ENDPOINT}."
+    return 1
+  fi
+
+  local devices_output
+  devices_output="$(adb devices -l)" || { err "No pude verificar el estado con 'adb devices -l'."; return 1; }
+  printf '\n%s\n' "$devices_output"
+  if awk -v serial="$CONNECT_ENDPOINT" '$1 == serial && $2 == "device" { found=1 } END { exit !found }' <<< "$devices_output"; then
+    ok "ADB funcional: ${CONNECT_ENDPOINT} aparece en estado device."
+    return 0
+  fi
+  err "ADB no confirmó ${CONNECT_ENDPOINT} en estado device. Revisa la pantalla de Depuración inalámbrica del teléfono."
+  return 1
 }
 
 pair_qr() {
@@ -189,32 +278,26 @@ pair_qr() {
     return 1
   fi
   ok "Emparejamiento completado."
-  printf '\n'
-  info "Estado actual de ADB:"
-  adb devices -l || warn "No pude consultar la lista de dispositivos ADB."
-  printf '\n'
+  connect_after_pairing
 }
 
 pair_code() {
   check_adb || return $?
   local endpoint
-  printf 'Dirección IP:puerto que muestra el móvil: '
+  printf 'Dirección IP:puerto de emparejamiento que muestra el móvil: '
   IFS= read -r endpoint || return 1
   if ! valid_endpoint "$endpoint"; then
-    err "Dirección no válida. Usa una IP o nombre de host seguido de :puerto (ejemplo: 192.168.1.20:37123)."
+    err "Dirección no válida. Usa IP:puerto (ejemplo: 192.168.1.20:37123)."
     return 2
   fi
   info "Cuando ADB lo solicite, escribe el código de seis dígitos que muestra el teléfono."
   info "No se guardará el código en un archivo ni en el historial del shell."
-  adb pair "$endpoint"
-  local result=$?
-  if (( result == 0 )); then
-    ok "Emparejamiento completado."
-    adb devices -l || true
-  else
-    err "El emparejamiento falló (código de salida $result)."
+  if ! adb pair "$endpoint"; then
+    err "El emparejamiento falló."
+    return 1
   fi
-  return "$result"
+  ok "Emparejamiento completado."
+  connect_after_pairing
 }
 
 show_menu() {
